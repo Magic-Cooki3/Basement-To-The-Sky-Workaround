@@ -1,291 +1,49 @@
-# Fix: Video Upload on Linux/Proton (Basement to the Sky Demo)
+# Basement to the Sky Demo - Linux Workaround
 
-The in-game MyTube laptop never shows the upload button on Linux. This is caused by three separate issues that all need to be fixed together.
+This repository contains tools and patches to fix the video upload mechanics for Linux/Proton users of the *Basement to the Sky* Demo.
 
-## Root Cause
+## What this fixes
+1. **VideoKit crashes/0-byte files:** The game normally records a video of your launch using VideoKit, which silently fails on Linux and produces 0-byte MP4 files. This causes the MyTube UI to crash or fail to upload.
+2. **Aggressive save wiping:** If the game fails certain checks, it wipes your save folder completely.
+3. **Upload Queuing:** Normally, if you launch multiple times without uploading, you lose all previous rewards and only get the reward for your last flight. This patch introduces a **Queue System** that stores every flight's score. You can upload multiple times back-to-back to claim all your earned money and science!
 
-**1. VideoKit recording produces 0-byte MP4 files.** The game uses a Unity package called VideoKit to record rocket flights. VideoKit phones home to videokit.ai to validate a license token before it will record anything. Under Proton this validation either fails silently or never completes, so the recorder creates an empty file and never writes any frames to it.
+## Files included
+- `Patcher.cs` and `patcher.csproj`: A Mono.Cecil patcher that modifies the game's `Assembly-CSharp.dll` to fix paths, bypass wipe logic, and inject the queue mechanics.
+- `ModHelper.dll`: A custom library we inject into the game that handles the persistent score queue (`PendingScores.txt`).
+- `fix_videos.sh`: A background bash script that creates fake black videos so the game thinks the upload succeeded.
 
-**2. The "new video recorded" callback never fires.** Because the recorder never actually starts, the callback chain that tells the MyTube UI "a new video is ready to upload" never executes. The upload panel is gated behind a boolean (`isNewVid`) that only gets set when `GameManager.S.NewVidRercorded()` is called at the end of a successful recording. Since recording fails, this call never happens, and the upload button never appears.
+## Installation
 
-**3. Path separators are hardcoded to Windows backslashes.** Several methods in MyTubeUI call `text.Replace("/", "\\")` on file paths before checking `File.Exists()`. Under Proton, forward slashes work fine, but replacing them with backslashes can break path resolution depending on the Wine/Proton version.
-
-**4. The game wipes save data aggressively.** On every new game start or version mismatch, `MainMenuUI.ResetAllDataExceptEssential()` deletes every file and folder in the save directory that is not in a small whitelist. This kills your recordings, your save file, and your rocket launch thumbnail.
-
-## Prerequisites
-
-- .NET SDK 8.0 (used to build the patcher, not needed at runtime)
-- ffmpeg (to generate a dummy MP4)
-
-Install the .NET SDK locally without root:
-
+### Step 1: Copy ModHelper
+Copy the included `ModHelper.dll` directly into the game's `Managed` directory:
 ```bash
-curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-chmod +x /tmp/dotnet-install.sh
-/tmp/dotnet-install.sh -c 8.0 --install-dir ~/.dotnet
-export DOTNET_ROOT=~/.dotnet
-export PATH=$DOTNET_ROOT:$PATH
+cp ModHelper.dll "$HOME/.local/share/Steam/steamapps/common/Basement to the Sky Demo/Basement to the Sky Demo_Data/Managed/ModHelper.dll"
 ```
 
-## Step 1: Build the Patcher
-
-Create a C# console project that uses Mono.Cecil to rewrite the game's compiled code:
-
-```bash
-mkdir -p /tmp/patcher && cd /tmp/patcher
-dotnet new console
-dotnet add package Mono.Cecil
-```
-
-Replace the contents of `/tmp/patcher/Program.cs` with:
-
-```csharp
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using Mono.Cecil;
-using Mono.Cecil.Cil;
-
-namespace Patcher
-{
-    class Program
-    {
-        static void Main(string[] args)
-        {
-            if (args.Length < 1)
-            {
-                Console.WriteLine("Usage: Patcher <path to Assembly-CSharp.dll>");
-                return;
-            }
-
-            string targetFile = args[0];
-
-            var resolver = new DefaultAssemblyResolver();
-            resolver.AddSearchDirectory(System.IO.Path.GetDirectoryName(targetFile));
-
-            using (var assembly = AssemblyDefinition.ReadAssembly(targetFile,
-                new ReaderParameters { ReadWrite = true, AssemblyResolver = resolver }))
-            {
-                var module = assembly.MainModule;
-                int fixes = 0;
-
-                // PATCH 1: Fix path separators in MyTubeUI
-                // Replace("/", "\\") becomes Replace("/", "/") which is a no-op
-                foreach (var type in module.Types)
-                {
-                    foreach (var method in type.Methods)
-                    {
-                        if (!method.HasBody) continue;
-                        var instructions = method.Body.Instructions;
-                        for (int i = 1; i < instructions.Count; i++)
-                        {
-                            var inst = instructions[i];
-                            if (inst.OpCode == OpCodes.Ldstr && (string)inst.Operand == "\\")
-                            {
-                                if (instructions[i - 1].OpCode == OpCodes.Ldstr
-                                    && (string)instructions[i - 1].Operand == "/")
-                                {
-                                    Console.WriteLine($"  [PATH] Fixed separator in {type.Name}::{method.Name}");
-                                    inst.Operand = "/";
-                                    fixes++;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // PATCH 2: Inject NewVidRercorded("RocketLaunch") into
-                // VideoKitTest.Rocket_OnRetriveRocketActive so the MyTube UI
-                // gets notified even when VideoKit recording fails silently
-                var videoKitTestType = module.Types.FirstOrDefault(t => t.Name == "VideoKitTest");
-                var gameManagerType = module.Types.FirstOrDefault(t => t.Name == "GameManager");
-
-                if (videoKitTestType != null && gameManagerType != null)
-                {
-                    var rocketMethod = videoKitTestType.Methods
-                        .FirstOrDefault(m => m.Name == "Rocket_OnRetriveRocketActive");
-                    var getSMethod = gameManagerType.Methods
-                        .FirstOrDefault(m => m.Name == "get_S");
-                    var newVidMethod = gameManagerType.Methods
-                        .FirstOrDefault(m => m.Name == "NewVidRercorded");
-
-                    if (rocketMethod != null && getSMethod != null
-                        && newVidMethod != null && rocketMethod.HasBody)
-                    {
-                        var processor = rocketMethod.Body.GetILProcessor();
-                        var retInst = rocketMethod.Body.Instructions.Last(i => i.OpCode == OpCodes.Ret);
-
-                        processor.InsertBefore(retInst,
-                            processor.Create(OpCodes.Call, module.ImportReference(getSMethod)));
-                        processor.InsertBefore(retInst,
-                            processor.Create(OpCodes.Ldstr, "RocketLaunch"));
-                        processor.InsertBefore(retInst,
-                            processor.Create(OpCodes.Callvirt, module.ImportReference(newVidMethod)));
-
-                        Console.WriteLine("  [INJECT] Added NewVidRercorded call");
-                        fixes++;
-                    }
-                }
-
-                // PATCH 3: Neutralize file/directory deletion in
-                // MainMenuUI.ResetAllDataExceptEssential to stop save wiping
-                var mainMenuType = module.Types.FirstOrDefault(t => t.Name == "MainMenuUI");
-                if (mainMenuType != null)
-                {
-                    var resetMethod = mainMenuType.Methods
-                        .FirstOrDefault(m => m.Name == "ResetAllDataExceptEssential");
-                    if (resetMethod != null && resetMethod.HasBody)
-                    {
-                        var processor = resetMethod.Body.GetILProcessor();
-                        foreach (var inst in resetMethod.Body.Instructions.ToList())
-                        {
-                            if (inst.OpCode == OpCodes.Callvirt
-                                && inst.Operand is MethodReference methodRef
-                                && methodRef.Name == "Delete")
-                            {
-                                if (methodRef.DeclaringType.FullName == "System.IO.FileSystemInfo")
-                                {
-                                    processor.Replace(inst, processor.Create(OpCodes.Pop));
-                                    Console.WriteLine("  [DELETE] Neutralized FileInfo.Delete");
-                                    fixes++;
-                                }
-                                else if (methodRef.DeclaringType.FullName == "System.IO.DirectoryInfo")
-                                {
-                                    var pop1 = processor.Create(OpCodes.Pop);
-                                    var pop2 = processor.Create(OpCodes.Pop);
-                                    processor.InsertBefore(inst, pop1);
-                                    processor.Replace(inst, pop2);
-                                    Console.WriteLine("  [DELETE] Neutralized DirectoryInfo.Delete");
-                                    fixes++;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (fixes > 0)
-                {
-                    Console.WriteLine($"\nApplied {fixes} patches. Saving...");
-                    assembly.Write();
-                    Console.WriteLine("Done.");
-                }
-            }
-        }
-    }
-}
-```
-
-## Step 2: Patch the DLL
-
-Back up the original DLL, then run the patcher against it:
+### Step 2: Run the Patcher
+You will need the `.NET 8.0 SDK` installed on your machine.
+Back up your original DLL and run the patcher from this directory:
 
 ```bash
 MANAGED="$HOME/.local/share/Steam/steamapps/common/Basement to the Sky Demo/Basement to the Sky Demo_Data/Managed"
 cp "$MANAGED/Assembly-CSharp.dll" "$MANAGED/Assembly-CSharp.dll.bak"
 
-export DOTNET_ROOT=~/.dotnet
-export PATH=$DOTNET_ROOT:$PATH
-cd /tmp/patcher
 dotnet run "$MANAGED/Assembly-CSharp.dll"
 ```
+You should see output confirming the patches were applied.
 
-You should see output confirming 7 patches applied (4 path fixes, 1 callback injection, 2 delete neutralizations).
-
-## Step 3: Create the Dummy MP4 and Watcher Script
-
-The game will still create 0-byte MP4 files every time you launch a rocket. These need to be replaced with a valid video file before the MyTube UI tries to load them, otherwise the video player crashes.
-
-Generate a 5-second black video:
-
+### Step 3: Run the Watcher
+Before launching the game, open a terminal and run the `fix_videos.sh` script:
 ```bash
-ffmpeg -y -f lavfi -i color=c=black:size=1280x720:rate=30 -t 5 -c:v libx264 -pix_fmt yuv420p ~/fake_rocket.mp4
+./fix_videos.sh
 ```
+Leave it running! This script dynamically feeds dummy videos to the game so the upload flow completes smoothly.
 
-Create the BlockSave.BE2 file if it does not exist (prevents a code path that can wipe saves):
+## How to use the Queue Feature
+1. With the watcher running, launch the game.
+2. Build and launch a rocket. Your score is automatically queued.
+3. Launch another rocket. It is also queued!
+4. Go to the laptop and click "Upload". You will get the reward for your *first* launch. The upload button will **stay visible**.
+5. Click it again to get the reward for your *second* launch! The button disappears when the queue is empty.
 
-```bash
-GAMEDIR="$HOME/.local/share/Steam/steamapps/compatdata/4385770/pfx/drive_c/users/steamuser/AppData/LocalLow/Orange3000k/Basement to the Sky Demo"
-touch "$GAMEDIR/BlockSave.BE2"
-chmod 444 "$GAMEDIR/BlockSave.BE2"
-```
-
-Replace any existing 0-byte recordings:
-
-```bash
-for f in "$GAMEDIR"/recording_*.mp4; do
-    [ -f "$f" ] && [ ! -s "$f" ] && cp ~/fake_rocket.mp4 "$f"
-done
-```
-
-## Step 4: Run the Watcher Before Launching
-
-Open a terminal and run this before starting the game. It polls the save directory every 200ms and replaces new 0-byte recordings as they appear:
-
-```bash
-#!/usr/bin/env bash
-# Basement to the Sky Demo - Linux Video Fix Watcher
-# Run this BEFORE launching the game. Press Ctrl+C to stop.
-
-GAMEDIR="$HOME/.local/share/Steam/steamapps/compatdata/4385770/pfx/drive_c/users/steamuser/AppData/LocalLow/Orange3000k/Basement to the Sky Demo"
-FAKE_MP4="$HOME/fake_rocket.mp4"
-
-if [ ! -f "$FAKE_MP4" ]; then
-    echo "[!] Creating dummy MP4..."
-    ffmpeg -y -f lavfi -i color=c=black:size=1280x720:rate=30 -t 5 -c:v libx264 -pix_fmt yuv420p "$FAKE_MP4" 2>/dev/null
-fi
-
-if [ ! -d "$GAMEDIR" ]; then
-    echo "[!] Game data directory not found. Launch the game at least once first."
-    exit 1
-fi
-
-# Ensure BlockSave.BE2 exists and is read-only
-if [ ! -f "$GAMEDIR/BlockSave.BE2" ]; then
-    touch "$GAMEDIR/BlockSave.BE2"
-    chmod 444 "$GAMEDIR/BlockSave.BE2"
-    echo "[+] Created read-only BlockSave.BE2"
-fi
-
-# Fix existing 0-byte recordings
-for f in "$GAMEDIR"/recording_*.mp4; do
-    [ -f "$f" ] && [ ! -s "$f" ] && cp "$FAKE_MP4" "$f" && echo "[+] Fixed: $(basename "$f")"
-done
-
-# Ensure RocketLaunch.mp4 exists (the game looks for this specific file on upload)
-if [ ! -f "$GAMEDIR/RocketLaunch.mp4" ]; then
-    cp "$FAKE_MP4" "$GAMEDIR/RocketLaunch.mp4"
-    echo "[+] Created RocketLaunch.mp4"
-fi
-
-echo ""
-echo "=== Watcher active ==="
-echo "Monitoring: $GAMEDIR"
-echo "Press Ctrl+C to stop."
-echo ""
-
-while true; do
-    # Replace any new 0-byte recording files
-    for f in "$GAMEDIR"/recording_*.mp4; do
-        [ -f "$f" ] && [ ! -s "$f" ] && cp "$FAKE_MP4" "$f" && echo "[+] Replaced: $(basename "$f")"
-    done
-
-    # Re-create RocketLaunch.mp4 if the game consumed it during an upload
-    # (VideoUpload moves it to "Flight N.mp4", so it disappears after each upload)
-    if [ ! -f "$GAMEDIR/RocketLaunch.mp4" ]; then
-        cp "$FAKE_MP4" "$GAMEDIR/RocketLaunch.mp4"
-        echo "[+] Re-created RocketLaunch.mp4 (consumed by upload)"
-    fi
-
-    sleep 0.2
-done
-```
-
-Leave this running, launch the game through Steam, build and launch a rocket, then open the laptop and go to MyTube. The upload button will appear. The video preview will be a black screen but the upload completes, you get your science and money, the quest progresses normally, and the upload button correctly hides so you can't abuse it.
-
-Press Ctrl+C in the terminal to stop the watcher when you are done playing.
-
-## Notes
-
-- The .NET SDK is only needed to build and run the patcher. It is not needed at runtime and can be removed after patching.
-- If a game update replaces Assembly-CSharp.dll, you will need to re-run the patcher.
-- Tested on Garuda Linux (Arch-based) with Proton and Wine Staging 11.11.
+*Note: All uploaded videos will show the same black 5-second preview in the MyTube interface, but your rewards will correctly reflect your flights!*
