@@ -86,36 +86,35 @@ namespace Patcher {
                     }
                 }
 
-                // QuestManager.CompleteQuest
+                // Fix rapid-fire bug by unsubscribing MyTubeUI_OnVideoUploaded instead of modifying CompleteQuest
                 var questMgrType = module.Types.FirstOrDefault(t => t.Name == "QuestManager");
-                if (questMgrType != null) {
-                    var method = questMgrType.Methods.FirstOrDefault(m => m.Name == "CompleteQuest");
-                    if (method != null && method.HasBody) {
+                if (questMgrType != null && myTubeUIType != null) {
+                    var method = questMgrType.Methods.FirstOrDefault(m => m.Name == "MyTubeUI_OnVideoUploaded");
+                    var removeEventMethod = myTubeUIType.Methods.FirstOrDefault(m => m.Name == "remove_OnVideoUploaded");
+                    var actionCtor = module.ImportReference(typeof(System.Action).GetConstructors()[0]);
+                    
+                    if (method != null && method.HasBody && removeEventMethod != null) {
                         var processor = method.Body.GetILProcessor();
                         var insts = method.Body.Instructions.ToList();
-                        var questDataType = module.Types.First(t => t.Name == "QuestData");
-                        var isCompletedField = module.ImportReference(questDataType.Fields.First(f => f.Name == "isCompleted"));
                         
-                        var firstRet = insts.FirstOrDefault(i => i.OpCode == OpCodes.Ret);
-                        var brtrueInst = insts.FirstOrDefault(i => i.OpCode == OpCodes.Brtrue_S || i.OpCode == OpCodes.Brtrue);
-                        
-                        if (firstRet != null && brtrueInst != null) {
-                            var targetLoc0Inst = (Instruction)brtrueInst.Operand;
+                        var callCompleteQuest = insts.FirstOrDefault(i => i.OpCode == OpCodes.Call && ((MethodReference)i.Operand).Name == "CompleteQuest");
+                        if (callCompleteQuest != null) {
+                            var ldarg0 = callCompleteQuest.Previous.Previous; // Should be ldarg.0 before CompleteQuest args
                             
-                            var newLdloc0 = processor.Create(OpCodes.Ldloc_0);
-                            var ldfldIsCompleted = processor.Create(OpCodes.Ldfld, isCompletedField);
-                            var brfalse = processor.Create(OpCodes.Brfalse_S, targetLoc0Inst);
-                            var newRet = processor.Create(OpCodes.Ret);
-                            
-                            processor.InsertAfter(firstRet, newRet);
-                            processor.InsertAfter(firstRet, brfalse);
-                            processor.InsertAfter(firstRet, ldfldIsCompleted);
-                            processor.InsertAfter(firstRet, newLdloc0);
-                            
-                            brtrueInst.Operand = newLdloc0;
-                            
-                            fixes++;
-                            Console.WriteLine("  [PATCH] Added isCompleted safety check to CompleteQuest");
+                            if (ldarg0 != null && ldarg0.OpCode == OpCodes.Ldarg_0) {
+                                var newLdarg0 = processor.Create(OpCodes.Ldarg_0);
+                                var ldftn = processor.Create(OpCodes.Ldftn, method);
+                                var newobj = processor.Create(OpCodes.Newobj, actionCtor);
+                                var callRemove = processor.Create(OpCodes.Call, module.ImportReference(removeEventMethod));
+
+                                processor.InsertBefore(ldarg0, newLdarg0);
+                                processor.InsertBefore(ldarg0, ldftn);
+                                processor.InsertBefore(ldarg0, newobj);
+                                processor.InsertBefore(ldarg0, callRemove);
+
+                                fixes++;
+                                Console.WriteLine("  [PATCH] Added unsubscribe safety to MyTubeUI_OnVideoUploaded");
+                            }
                         }
                     }
                 }
