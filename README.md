@@ -1,5 +1,3 @@
-# BUGS BEING WORKED OUT, PLEASE BE PATIENT - CURRENTLY PARITIALLY WORKING BUT FULL WORKING IS POSSIBLE AND HAS BEEN DONE
-
 # Fix: Video Upload on Linux/Proton (Basement to the Sky Demo)
 
 The in-game MyTube laptop never shows the upload button on Linux. This is caused by three separate issues that all need to be fixed together.
