@@ -1,3 +1,5 @@
+# BUGS STILL BEING FIXED, PLEASE REPORT ANYTHING YOU FIND
+
 # Basement to the Sky Demo - Linux Workaround
 
 This repository contains tools and patches to fix the video upload mechanics for Linux/Proton users of the *Basement to the Sky* Demo.
