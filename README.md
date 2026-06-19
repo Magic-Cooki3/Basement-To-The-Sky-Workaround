@@ -1,5 +1,3 @@
-# WORKAROUND STILL IN DEVELOPMENT, BUGS BEING FIXED
-
 # Fix: Video Upload on Linux/Proton (Basement to the Sky Demo)
 
 The in-game MyTube laptop never shows the upload button on Linux. This is caused by three separate issues that all need to be fixed together.
@@ -224,16 +222,65 @@ done
 Open a terminal and run this before starting the game. It polls the save directory every 200ms and replaces new 0-byte recordings as they appear:
 
 ```bash
+#!/usr/bin/env bash
+# Basement to the Sky Demo - Linux Video Fix Watcher
+# Run this BEFORE launching the game. Press Ctrl+C to stop.
+
 GAMEDIR="$HOME/.local/share/Steam/steamapps/compatdata/4385770/pfx/drive_c/users/steamuser/AppData/LocalLow/Orange3000k/Basement to the Sky Demo"
+FAKE_MP4="$HOME/fake_rocket.mp4"
+
+if [ ! -f "$FAKE_MP4" ]; then
+    echo "[!] Creating dummy MP4..."
+    ffmpeg -y -f lavfi -i color=c=black:size=1280x720:rate=30 -t 5 -c:v libx264 -pix_fmt yuv420p "$FAKE_MP4" 2>/dev/null
+fi
+
+if [ ! -d "$GAMEDIR" ]; then
+    echo "[!] Game data directory not found. Launch the game at least once first."
+    exit 1
+fi
+
+# Ensure BlockSave.BE2 exists and is read-only
+if [ ! -f "$GAMEDIR/BlockSave.BE2" ]; then
+    touch "$GAMEDIR/BlockSave.BE2"
+    chmod 444 "$GAMEDIR/BlockSave.BE2"
+    echo "[+] Created read-only BlockSave.BE2"
+fi
+
+# Fix existing 0-byte recordings
+for f in "$GAMEDIR"/recording_*.mp4; do
+    [ -f "$f" ] && [ ! -s "$f" ] && cp "$FAKE_MP4" "$f" && echo "[+] Fixed: $(basename "$f")"
+done
+
+# Ensure RocketLaunch.mp4 exists (the game looks for this specific file on upload)
+if [ ! -f "$GAMEDIR/RocketLaunch.mp4" ]; then
+    cp "$FAKE_MP4" "$GAMEDIR/RocketLaunch.mp4"
+    echo "[+] Created RocketLaunch.mp4"
+fi
+
+echo ""
+echo "=== Watcher active ==="
+echo "Monitoring: $GAMEDIR"
+echo "Press Ctrl+C to stop."
+echo ""
+
 while true; do
+    # Replace any new 0-byte recording files
     for f in "$GAMEDIR"/recording_*.mp4; do
-        [ -f "$f" ] && [ ! -s "$f" ] && cp ~/fake_rocket.mp4 "$f" && echo "Replaced: $(basename "$f")"
+        [ -f "$f" ] && [ ! -s "$f" ] && cp "$FAKE_MP4" "$f" && echo "[+] Replaced: $(basename "$f")"
     done
+
+    # Re-create RocketLaunch.mp4 if the game consumed it during an upload
+    # (VideoUpload moves it to "Flight N.mp4", so it disappears after each upload)
+    if [ ! -f "$GAMEDIR/RocketLaunch.mp4" ]; then
+        cp "$FAKE_MP4" "$GAMEDIR/RocketLaunch.mp4"
+        echo "[+] Re-created RocketLaunch.mp4 (consumed by upload)"
+    fi
+
     sleep 0.2
 done
 ```
 
-Leave this running, launch the game through Steam, build and launch a rocket, then open the laptop and go to MyTube. The upload button will appear. The video preview will be a black screen but the upload completes and the quest progresses normally.
+Leave this running, launch the game through Steam, build and launch a rocket, then open the laptop and go to MyTube. The upload button will appear. The video preview will be a black screen but the upload completes, you get your science and money, the quest progresses normally, and the upload button correctly hides so you can't abuse it.
 
 Press Ctrl+C in the terminal to stop the watcher when you are done playing.
 
@@ -241,5 +288,4 @@ Press Ctrl+C in the terminal to stop the watcher when you are done playing.
 
 - The .NET SDK is only needed to build and run the patcher. It is not needed at runtime and can be removed after patching.
 - If a game update replaces Assembly-CSharp.dll, you will need to re-run the patcher.
-- The upload button can be clicked multiple times per video. This is a minor side effect of bypassing the normal recording callback flow.
 - Tested on Garuda Linux (Arch-based) with Proton and Wine Staging 11.11.
