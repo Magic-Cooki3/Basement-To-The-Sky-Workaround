@@ -1,15 +1,71 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 
 namespace Patcher {
     class Program {
+        const string GameInstallSubpath = "Basement to the Sky Demo/Basement to the Sky Demo_Data/Managed";
+
+        static string FindAssemblyCSharp() {
+            var steamRoots = new[] {
+                Path.Combine(Environment.GetEnvironmentVariable("HOME") ?? "", ".local/share/Steam"),
+                Path.Combine(Environment.GetEnvironmentVariable("HOME") ?? "", ".steam/steam"),
+                Path.Combine(Environment.GetEnvironmentVariable("HOME") ?? "", ".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+            };
+
+            string libraryFoldersVdf = steamRoots
+                .Select(r => Path.Combine(r, "steamapps", "libraryfolders.vdf"))
+                .FirstOrDefault(File.Exists);
+
+            var candidateLibraries = new List<string>(steamRoots);
+
+            if (libraryFoldersVdf != null) {
+                var content = File.ReadAllText(libraryFoldersVdf);
+                foreach (Match m in Regex.Matches(content, "\"path\"\\s*\"([^\"]+)\"")) {
+                    candidateLibraries.Add(m.Groups[1].Value.Replace("\\\\", "/"));
+                }
+            }
+
+            foreach (var lib in candidateLibraries) {
+                var managed = Path.Combine(lib, "steamapps", "common", GameInstallSubpath);
+                var dll = Path.Combine(managed, "Assembly-CSharp.dll");
+                if (File.Exists(dll)) return dll;
+            }
+
+            return null;
+        }
+
         static void Main(string[] args) {
-            string targetFile = args.Length > 0 ? args[0] :
-                "/home/magiccookie/.local/share/Steam/steamapps/common/Basement to the Sky Demo/Basement to the Sky Demo_Data/Managed/Assembly-CSharp.dll";
-            string modHelperFile = System.IO.Path.Combine(
-                System.IO.Path.GetDirectoryName(targetFile), "ModHelper.dll");
+            string targetFile;
+            if (args.Length >= 1) {
+                targetFile = args[0];
+            } else {
+                Console.WriteLine("No path given, trying to auto-detect Steam library...");
+                targetFile = FindAssemblyCSharp();
+                if (targetFile == null) {
+                    Console.WriteLine("Could not auto-detect the game install. Run with an explicit path:");
+                    Console.WriteLine("  dotnet run -- \"/path/to/.../Managed/Assembly-CSharp.dll\"");
+                    return;
+                }
+                Console.WriteLine($"Found: {targetFile}");
+            }
+            string modHelperFile = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(targetFile), "ModHelper.dll");
+            string backupFile = targetFile + ".bak";
+
+            // Always patch from a clean original. If no backup exists yet, this IS the
+            // original - make one. If a backup already exists, restore from it first,
+            // so re-running the patcher never patches an already-patched DLL.
+            if (!File.Exists(backupFile)) {
+                File.Copy(targetFile, backupFile);
+                Console.WriteLine($"Created backup: {backupFile}");
+            } else {
+                File.Copy(backupFile, targetFile, overwrite: true);
+                Console.WriteLine($"Restored original from backup before patching: {backupFile}");
+            }
 
             var resolver = new DefaultAssemblyResolver();
             resolver.AddSearchDirectory(System.IO.Path.GetDirectoryName(targetFile));
